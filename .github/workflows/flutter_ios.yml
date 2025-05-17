@@ -1,0 +1,115 @@
+name: Flutter iOS Build and Publish
+on:
+  workflow_dispatch: # Allows manual triggering of the workflow
+jobs:
+  flutter_ios_build_publish:
+    runs-on: macos-latest
+    steps: 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.2'
+          channel: 'stable'
+      - name: Setup Ruby for Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+      - name: Get dependencies
+        working-directory: ./usr
+        run: flutter pub get
+      - name: Setup iOS certificates and provisioning profiles
+        run: |
+          echo "Setting up iOS signing configuration..."
+          # Create temporary keychain
+          KEYCHAIN_NAME="flutter_ios_keychain"
+          KEYCHAIN_PASSWORD="temporary_password"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security default-keychain -s "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -t 3600 -l "$KEYCHAIN_NAME"
+          
+          # Import certificates to keychain
+          echo "${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}" | base64 --decode > distribution_certificate.p12
+          echo "${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}" > certificate_password.txt
+          security import distribution_certificate.p12 -k "$KEYCHAIN_NAME" -P "$(cat certificate_password.txt)" -A
+          
+          # Create provisioning profiles directory
+          mkdir -p ~/Library/MobileDevice/Provisioning\\ Profiles
+          
+          # Install provisioning profile
+          echo "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" | base64 --decode > provisioning_profile.mobileprovision
+          UUID=$(grep -a -A 1 "UUID" provisioning_profile.mobileprovision | grep -o "[-A-Za-z0-9]\\{36\\}")
+          cp provisioning_profile.mobileprovision ~/Library/MobileDevice/Provisioning\\ Profiles/"$UUID".mobileprovision
+      - name: Build iOS application
+        working-directory: ./usr
+        run: flutter build ios --release
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-build
+          path: ./usr/build/ios/iphoneos
+          retention-days: 7
+      - name: Create Fastlane directory and file
+        run: |
+          mkdir -p ./usr/ios/fastlane
+          cat > ./usr/ios/fastlane/Fastfile << 'FASTFILE_EOF'
+# Disable Fastlane's usage data collection
+opt_out_usage
+
+default_platform(:ios)
+
+platform :ios do
+  desc "Deploy to App Store Connect"
+  lane :publish_to_app_store do
+    puts "Using bundle identifier: com.example.couldai_user_app"
+    
+    # Build and sign the application
+    build_app(
+      workspace: "../ios/Runner.xcworkspace",
+      scheme: "Runner",
+      export_method: "app-store",
+      export_options: {
+        provisioningProfiles: { 
+          "com.example.couldai_user_app" => "App Store Distribution Profile"
+        }
+      },
+      silent: true,
+      clean: true
+    )
+    
+    # Upload to App Store Connect
+    upload_to_app_store(
+      app_identifier: "com.example.couldai_user_app",
+      app_version: get_version_number(xcodeproj: "../ios/Runner.xcodeproj"),
+      skip_metadata: true,
+      skip_screenshots: true,
+      skip_app_version_update: false,
+      force: true,
+      precheck_include_in_app_purchases: false,
+      submit_for_review: false
+    )
+  end
+end
+FASTFILE_EOF
+      - name: Install Fastlane
+        run: gem install fastlane
+      - name: Check Fastlane configuration
+        working-directory: ./usr/ios
+        run: |
+          echo "Checking Fastlane directory structure:"
+          ls -la fastlane/
+          echo "\nChecking Fastfile content:"
+          cat fastlane/Fastfile
+      - name: Deploy to App Store
+        id: deploy_to_app_store
+        working-directory: ./usr/ios
+        env:
+          FASTLANE_USER: ${{ secrets.APPLE_ID }}
+          FASTLANE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APPLICATION_SPECIFIC_PASSWORD }}
+          FASTLANE_DONT_STORE_PASSWORD: true
+          FASTLANE_SKIP_UPDATE_CHECK: true
+        run: fastlane publish_to_app_store
